@@ -1,0 +1,145 @@
+# Open a PR when upstream elidickinson/pi-claude-bridge publishes a new release tag.
+#
+# The PR head is the upstream tag commit, and the base is this fork's main. Merge it
+# with "Create a merge commit". Do not squash or rebase it: that drops the upstream
+# history, and the next sync conflicts again.
+#
+# Token: GITHUB_TOKEN cannot push commits that change .github/workflows/, and a PR it
+# opens does not start CI. Add a fine-grained PAT as the SYNC_TOKEN secret (Contents,
+# Pull requests and Workflows: read and write) to avoid both limits.
+name: Upstream release PR
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to sync (default: the newest vX.Y.Z)"
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-release-pr
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: elidickinson/pi-claude-bridge
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Find the newest upstream tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --quiet upstream --tags --no-recurse-submodules
+          tag="${INPUT_TAG:-$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)}"
+          if [ -z "$tag" ] || ! git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            echo "::error::No upstream tag found (input: '${INPUT_TAG}')."
+            exit 1
+          fi
+          branch="sync/upstream-$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$tag" origin/main; then
+            echo "main already contains $tag. Nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "Branch $branch exists. A PR for $tag is already open or was handled."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the PR body
+        if: steps.tag.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          prev="$(git describe --tags --abbrev=0 --match 'v[0-9]*' origin/main 2>/dev/null || true)"
+
+          # Try the merge to list the files that will conflict.
+          git -c user.name=sync -c user.email=sync@localhost merge --no-commit --no-ff "$TAG" >/dev/null 2>&1 || true
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          git merge --abort 2>/dev/null || true
+
+          {
+            echo "Upstream released [\`$TAG\`](https://github.com/${UPSTREAM_REPO}/releases/tag/$TAG)."
+            if [ -n "$prev" ]; then
+              echo "Changes since \`$prev\`: https://github.com/${UPSTREAM_REPO}/compare/$prev...$TAG"
+            fi
+            echo
+            echo "## Upstream changelog"
+            echo
+            git show "$TAG:CHANGELOG.md" | awk -v v="$version" '
+              $0 ~ "^## " v "( |$)" { on = 1; next }
+              on && /^## / { exit }
+              on { print }'
+            echo
+            echo "## Merge conflicts"
+            echo
+            if [ -n "$conflicts" ]; then
+              echo "A test merge found conflicts in these files. Resolve them locally:"
+              echo
+              echo "$conflicts" | sed 's/^/- `/; s/$/`/'
+              echo
+              echo '```bash'
+              echo "git fetch origin && git checkout main && git merge origin/sync/upstream-$TAG"
+              echo '```'
+            else
+              echo "None. The PR merges cleanly."
+            fi
+            echo
+            echo "## Local patch PRs"
+            echo
+            echo "| Patch | Upstream PR | State |"
+            echo "|---|---|---|"
+            grep -oE '^\| `pr[0-9]+\.patch`' patches/PATCHES.md 2>/dev/null | grep -oE '[0-9]+' | while read -r n; do
+              state="$(gh pr view "$n" -R "$UPSTREAM_REPO" --json state -q .state 2>/dev/null || echo unknown)"
+              echo "| \`pr$n.patch\` | ${UPSTREAM_REPO}#$n | $state |"
+            done
+            echo
+            echo "## After the merge"
+            echo
+            echo "- Merge with **Create a merge commit**. Do not squash or rebase."
+            echo "- Keep upstream's \`version\` in \`package.json\` and upstream's released \`CHANGELOG.md\` sections."
+            echo "- For a patch whose PR is \`MERGED\`, keep upstream's code and delete the patch file."
+            echo "- Then run \`/sync-upstream-patches\` to update \`patches/PATCHES.md\`."
+          } > "$RUNNER_TEMP/body.md"
+          cat "$RUNNER_TEMP/body.md"
+
+      - name: Push the branch and open the PR
+        if: steps.tag.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          BRANCH: ${{ steps.tag.outputs.branch }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          if ! git push origin "refs/tags/$TAG^{commit}:refs/heads/$BRANCH"; then
+            echo "::error::Push failed. If upstream changed .github/workflows/, add a SYNC_TOKEN secret with the Workflows permission."
+            exit 1
+          fi
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$BRANCH" \
+            --title "chore(upstream): sync with $TAG" \
+            --body-file "$RUNNER_TEMP/body.md"
